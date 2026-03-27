@@ -473,74 +473,164 @@ impl HarmonyEncoding {
         }
     }
 
+    /// Key used by jsonref to store original sibling properties of resolved `$ref` nodes.
+    const JSONREF_SIBLING_KEY: &'static str = "__harmony_ref_siblings__";
+
+    /// Resolve all `$ref` pointers in a JSON Schema, inlining the referenced definitions.
+    ///
+    /// Uses the `jsonref` crate for the primary resolution of object-level `$ref` pointers,
+    /// then post-processes to handle two gaps that `jsonref` does not cover:
+    ///
+    /// 1. **Sibling merging** — Per JSON Schema Draft 2019-09+, properties alongside `$ref`
+    ///    (e.g. `description`, extra `required` entries) must be merged into the resolved
+    ///    target. `jsonref` stores these under a reference key; we merge annotation keywords
+    ///    (title, description, …) directly and deep-merge structural keywords (with special
+    ///    union semantics for `required` arrays).
+    ///
+    /// 2. **Array traversal** — `jsonref` only walks object values, so `$ref` nodes inside
+    ///    JSON arrays (e.g. `oneOf`, `anyOf`, `items`) are left unresolved. A second pass
+    ///    resolves these using the already-dereferenced root.
     fn resolve_json_schema_refs(schema: &serde_json::Value) -> serde_json::Value {
-        fn resolve_node(
-            node: &serde_json::Value,
-            root: &serde_json::Value,
-            active_refs: &mut HashSet<String>,
-        ) -> serde_json::Value {
-            match node {
-                serde_json::Value::Object(map) => {
-                    if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
-                        if let Some(target) =
-                            HarmonyEncoding::resolve_json_pointer_ref(root, reference)
-                        {
-                            if active_refs.contains(reference) {
-                                return serde_json::Value::Object(serde_json::Map::new());
-                            }
+        let mut result = schema.clone();
 
-                            active_refs.insert(reference.to_string());
-                            let mut resolved_target = resolve_node(target, root, active_refs);
-                            active_refs.remove(reference);
+        let mut resolver = jsonref::JsonRef::new();
+        resolver.set_reference_key(Self::JSONREF_SIBLING_KEY);
 
-                            let mut annotation_siblings = serde_json::Map::new();
-                            let mut structural_siblings = serde_json::Map::new();
-                            for (key, value) in map {
-                                if key == "$ref" {
-                                    continue;
-                                }
+        if resolver.deref_value(&mut result).is_ok() {
+            let root = result.clone();
+            Self::post_process_resolved_schema(&mut result, &root, &mut HashSet::new());
+        }
 
-                                let resolved_value = resolve_node(value, root, active_refs);
-                                if HarmonyEncoding::is_json_schema_annotation_keyword(key) {
-                                    annotation_siblings.insert(key.clone(), resolved_value);
-                                } else {
-                                    structural_siblings.insert(key.clone(), resolved_value);
-                                }
-                            }
+        result
+    }
 
-                            if let serde_json::Value::Object(ref mut resolved_map) = resolved_target
-                            {
-                                resolved_map.extend(annotation_siblings);
-                            }
-
-                            if !structural_siblings.is_empty() {
-                                HarmonyEncoding::merge_json_schema_values(
-                                    &mut resolved_target,
-                                    serde_json::Value::Object(structural_siblings),
-                                );
-                            }
-
-                            return resolved_target;
+    /// Post-processes a schema resolved by `jsonref`:
+    /// - Merges sibling properties stored under [`Self::JSONREF_SIBLING_KEY`]
+    /// - Resolves `$ref` inside arrays that `jsonref` skipped
+    fn post_process_resolved_schema(
+        value: &mut serde_json::Value,
+        root: &serde_json::Value,
+        active_refs: &mut HashSet<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                // Merge sibling overrides that jsonref stored
+                if let Some(serde_json::Value::Object(siblings)) =
+                    map.remove(Self::JSONREF_SIBLING_KEY)
+                {
+                    for (key, val) in siblings {
+                        if Self::is_json_schema_annotation_keyword(&key) {
+                            map.insert(key, val);
+                        } else {
+                            Self::merge_sibling_into(map, key, val);
                         }
                     }
-
-                    let mut resolved_map = serde_json::Map::with_capacity(map.len());
-                    for (key, value) in map {
-                        resolved_map.insert(key.clone(), resolve_node(value, root, active_refs));
-                    }
-                    serde_json::Value::Object(resolved_map)
                 }
-                serde_json::Value::Array(items) => serde_json::Value::Array(
-                    items
-                        .iter()
-                        .map(|item| resolve_node(item, root, active_refs))
-                        .collect(),
-                ),
-                _ => node.clone(),
+
+                for (_, v) in map.iter_mut() {
+                    Self::post_process_resolved_schema(v, root, active_refs);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr.iter_mut() {
+                    Self::resolve_array_ref_if_needed(item, root, active_refs);
+                    Self::post_process_resolved_schema(item, root, active_refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// If `item` is an object with an unresolved `$ref`, resolve it inline
+    /// (including merging any sibling properties).
+    fn resolve_array_ref_if_needed(
+        item: &mut serde_json::Value,
+        root: &serde_json::Value,
+        active_refs: &mut HashSet<String>,
+    ) {
+        let ref_str = match item
+            .as_object()
+            .and_then(|m| m.get("$ref"))
+            .and_then(|v| v.as_str())
+        {
+            Some(s) => s.to_string(),
+            None => return,
+        };
+
+        if active_refs.contains(&ref_str) {
+            *item = serde_json::Value::Object(serde_json::Map::new());
+            return;
+        }
+
+        let target = match Self::resolve_json_pointer_ref(root, &ref_str) {
+            Some(t) => t.clone(),
+            None => return,
+        };
+
+        // Collect siblings (everything except `$ref`)
+        let siblings: Vec<(String, serde_json::Value)> = item
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .filter(|(k, _)| k.as_str() != "$ref")
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        active_refs.insert(ref_str.clone());
+        *item = target;
+
+        // Recursively resolve the target
+        Self::post_process_resolved_schema(item, root, active_refs);
+
+        // Merge siblings into resolved target
+        if let serde_json::Value::Object(ref mut resolved_map) = item {
+            for (key, val) in siblings {
+                if Self::is_json_schema_annotation_keyword(&key) {
+                    resolved_map.insert(key, val);
+                } else {
+                    Self::merge_sibling_into(resolved_map, key, val);
+                }
             }
         }
 
-        resolve_node(schema, schema, &mut HashSet::new())
+        active_refs.remove(&ref_str);
+    }
+
+    /// Merge a single structural sibling key/value into a resolved schema map,
+    /// with special union semantics for `required` arrays.
+    fn merge_sibling_into(
+        map: &mut serde_json::Map<String, serde_json::Value>,
+        key: String,
+        val: serde_json::Value,
+    ) {
+        if key == "required" {
+            if let serde_json::Value::Array(overlay_items) = val {
+                match map.get_mut("required") {
+                    Some(serde_json::Value::Array(base_items)) => {
+                        for item in overlay_items {
+                            if !base_items.contains(&item) {
+                                base_items.push(item);
+                            }
+                        }
+                    }
+                    _ => {
+                        map.insert(key, serde_json::Value::Array(overlay_items));
+                    }
+                }
+                return;
+            }
+        }
+
+        match map.get_mut(&key) {
+            Some(base_value) => {
+                Self::merge_json_schema_values(base_value, val);
+            }
+            None => {
+                map.insert(key, val);
+            }
+        }
     }
 
     /// Helper to convert a JSON schema (OpenAPI style) to a TypeScript type definition.
