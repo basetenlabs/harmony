@@ -403,8 +403,153 @@ impl HarmonyEncoding {
         )
     }
 
+    fn resolve_json_pointer_ref<'a>(
+        root: &'a serde_json::Value,
+        reference: &str,
+    ) -> Option<&'a serde_json::Value> {
+        if !reference.starts_with('#') {
+            return None;
+        }
+
+        if reference == "#" {
+            return Some(root);
+        }
+
+        root.pointer(&reference[1..])
+    }
+
+    fn is_json_schema_annotation_keyword(key: &str) -> bool {
+        matches!(
+            key,
+            "title"
+                | "description"
+                | "default"
+                | "examples"
+                | "deprecated"
+                | "readOnly"
+                | "writeOnly"
+                | "nullable"
+        )
+    }
+
+    fn merge_json_schema_values(base: &mut serde_json::Value, overlay: serde_json::Value) {
+        match (base, overlay) {
+            (serde_json::Value::Object(base_map), serde_json::Value::Object(overlay_map)) => {
+                for (key, overlay_value) in overlay_map {
+                    match key.as_str() {
+                        "required" => {
+                            let serde_json::Value::Array(overlay_items) = overlay_value else {
+                                base_map.insert(key, overlay_value);
+                                continue;
+                            };
+
+                            match base_map.get_mut(&key) {
+                                Some(serde_json::Value::Array(base_items)) => {
+                                    for item in overlay_items {
+                                        if !base_items.contains(&item) {
+                                            base_items.push(item);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    base_map.insert(key, serde_json::Value::Array(overlay_items));
+                                }
+                            }
+                        }
+                        _ => match base_map.get_mut(&key) {
+                            Some(base_value) => {
+                                Self::merge_json_schema_values(base_value, overlay_value);
+                            }
+                            None => {
+                                base_map.insert(key, overlay_value);
+                            }
+                        },
+                    }
+                }
+            }
+            (base_value, overlay_value) => {
+                *base_value = overlay_value;
+            }
+        }
+    }
+
+    fn resolve_json_schema_refs(schema: &serde_json::Value) -> serde_json::Value {
+        fn resolve_node(
+            node: &serde_json::Value,
+            root: &serde_json::Value,
+            active_refs: &mut HashSet<String>,
+        ) -> serde_json::Value {
+            match node {
+                serde_json::Value::Object(map) => {
+                    if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
+                        if let Some(target) =
+                            HarmonyEncoding::resolve_json_pointer_ref(root, reference)
+                        {
+                            if active_refs.contains(reference) {
+                                return serde_json::Value::Object(serde_json::Map::new());
+                            }
+
+                            active_refs.insert(reference.to_string());
+                            let mut resolved_target = resolve_node(target, root, active_refs);
+                            active_refs.remove(reference);
+
+                            let mut annotation_siblings = serde_json::Map::new();
+                            let mut structural_siblings = serde_json::Map::new();
+                            for (key, value) in map {
+                                if key == "$ref" {
+                                    continue;
+                                }
+
+                                let resolved_value = resolve_node(value, root, active_refs);
+                                if HarmonyEncoding::is_json_schema_annotation_keyword(key) {
+                                    annotation_siblings.insert(key.clone(), resolved_value);
+                                } else {
+                                    structural_siblings.insert(key.clone(), resolved_value);
+                                }
+                            }
+
+                            if let serde_json::Value::Object(ref mut resolved_map) = resolved_target
+                            {
+                                resolved_map.extend(annotation_siblings);
+                            }
+
+                            if !structural_siblings.is_empty() {
+                                HarmonyEncoding::merge_json_schema_values(
+                                    &mut resolved_target,
+                                    serde_json::Value::Object(structural_siblings),
+                                );
+                            }
+
+                            return resolved_target;
+                        }
+                    }
+
+                    let mut resolved_map = serde_json::Map::with_capacity(map.len());
+                    for (key, value) in map {
+                        resolved_map.insert(key.clone(), resolve_node(value, root, active_refs));
+                    }
+                    serde_json::Value::Object(resolved_map)
+                }
+                serde_json::Value::Array(items) => serde_json::Value::Array(
+                    items
+                        .iter()
+                        .map(|item| resolve_node(item, root, active_refs))
+                        .collect(),
+                ),
+                _ => node.clone(),
+            }
+        }
+
+        resolve_node(schema, schema, &mut HashSet::new())
+    }
+
     /// Helper to convert a JSON schema (OpenAPI style) to a TypeScript type definition.
     fn json_schema_to_typescript(schema: &serde_json::Value, indent: &str) -> String {
+        let resolved_schema = Self::resolve_json_schema_refs(schema);
+        Self::json_schema_to_typescript_inner(&resolved_schema, indent)
+    }
+
+    fn json_schema_to_typescript_inner(schema: &serde_json::Value, indent: &str) -> String {
         // Helper to check if this schema is an enum
         fn is_enum(schema: &serde_json::Value) -> bool {
             schema
@@ -427,7 +572,7 @@ impl HarmonyEncoding {
                         first = false;
                     }
                     let type_str =
-                        Self::json_schema_to_typescript(variant, &format!("{indent}   "));
+                        Self::json_schema_to_typescript_inner(variant, &format!("{indent}   "));
                     let mut type_str = type_str;
                     if variant
                         .get("nullable")
@@ -600,7 +745,7 @@ impl HarmonyEncoding {
                                         // Render each variant
                                         for (i, variant) in arr.iter().enumerate() {
                                             out.push_str(&format!("{indent} | "));
-                                            let type_str = Self::json_schema_to_typescript(
+                                            let type_str = Self::json_schema_to_typescript_inner(
                                                 variant,
                                                 &format!("{indent}   "),
                                             );
@@ -668,8 +813,10 @@ impl HarmonyEncoding {
                                     }
                                 ));
                                 // Handle nullable
-                                let mut type_str =
-                                    Self::json_schema_to_typescript(val, &format!("{indent}    "));
+                                let mut type_str = Self::json_schema_to_typescript_inner(
+                                    val,
+                                    &format!("{indent}    "),
+                                );
                                 if val
                                     .get("nullable")
                                     .and_then(|n| n.as_bool())
@@ -724,7 +871,7 @@ impl HarmonyEncoding {
                 "boolean" => "boolean".to_string(),
                 "array" => {
                     if let Some(items) = schema.get("items") {
-                        format!("{}[]", Self::json_schema_to_typescript(items, indent))
+                        format!("{}[]", Self::json_schema_to_typescript_inner(items, indent))
                     } else {
                         "Array<any>".to_string()
                     }
@@ -742,7 +889,7 @@ impl HarmonyEncoding {
                     } else {
                         first = false;
                     }
-                    out.push_str(&Self::json_schema_to_typescript(variant, indent));
+                    out.push_str(&Self::json_schema_to_typescript_inner(variant, indent));
                 }
                 return out;
             }

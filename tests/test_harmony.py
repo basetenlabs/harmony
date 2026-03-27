@@ -555,6 +555,119 @@ def test_render_functions_with_parameters():
     assert encoding.decode_utf8(tokens) == expected_output
 
 
+def test_render_functions_with_ref_parameters():
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+
+    dev = DeveloperContent.new().with_function_tools(
+        [
+            ToolDescription.new(
+                "authenticate_first_name",
+                "Authenticate the caller's first name.",
+                parameters={
+                    "$defs": {
+                        "Schema": {
+                            "type": "object",
+                            "properties": {
+                                "input": {"type": "string"},
+                                "notes": {"type": "string"},
+                            },
+                            "required": ["input", "notes"],
+                            "additionalProperties": False,
+                        }
+                    },
+                    "type": "object",
+                    "properties": {
+                        "data": {"$ref": "#/$defs/Schema"},
+                    },
+                    "required": ["data"],
+                    "additionalProperties": False,
+                },
+            )
+        ]
+    )
+
+    convo = Conversation.from_messages(
+        [
+            Message.from_role_and_content(
+                Role.SYSTEM,
+                SystemContent.new()
+                .with_reasoning_effort(ReasoningEffort.HIGH)
+                .with_conversation_start_date("2025-06-28"),
+            ),
+            Message.from_role_and_content(Role.DEVELOPER, dev),
+            Message.from_role_and_content(Role.USER, "My first name is Michel."),
+        ]
+    )
+
+    rendered = encoding.decode_utf8(
+        encoding.render_conversation_for_completion(convo, Role.ASSISTANT)
+    )
+
+    assert "type authenticate_first_name = (_: {" in rendered
+    assert "data: {" in rendered
+    assert "input: string," in rendered
+    assert "notes: string," in rendered
+    assert "#/$defs/Schema" not in rendered
+
+
+def test_render_functions_with_ref_parameter_overrides():
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+
+    dev = DeveloperContent.new().with_function_tools(
+        [
+            ToolDescription.new(
+                "authenticate_first_name",
+                "Authenticate the caller's first name.",
+                parameters={
+                    "$defs": {
+                        "Schema": {
+                            "type": "object",
+                            "properties": {
+                                "input": {"type": "string"},
+                                "notes": {"type": "string"},
+                            },
+                            "required": ["input"],
+                            "additionalProperties": False,
+                        }
+                    },
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "$ref": "#/$defs/Schema",
+                            "description": "Expanded caller data.",
+                            "required": ["notes"],
+                        },
+                    },
+                    "required": ["data"],
+                    "additionalProperties": False,
+                },
+            )
+        ]
+    )
+
+    convo = Conversation.from_messages(
+        [
+            Message.from_role_and_content(
+                Role.SYSTEM,
+                SystemContent.new()
+                .with_reasoning_effort(ReasoningEffort.HIGH)
+                .with_conversation_start_date("2025-06-28"),
+            ),
+            Message.from_role_and_content(Role.DEVELOPER, dev),
+            Message.from_role_and_content(Role.USER, "My first name is Michel."),
+        ]
+    )
+
+    rendered = encoding.decode_utf8(
+        encoding.render_conversation_for_completion(convo, Role.ASSISTANT)
+    )
+
+    assert "// Expanded caller data." in rendered
+    assert "input: string," in rendered
+    assert "notes: string," in rendered
+    assert "notes?: string," not in rendered
+
+
 def test_no_tools():
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     expected_output = (

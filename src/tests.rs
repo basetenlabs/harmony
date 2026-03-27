@@ -391,6 +391,111 @@ fn test_render_functions_with_parameters() {
 }
 
 #[test]
+fn test_render_functions_with_ref_parameters() {
+    let encoding = load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss).unwrap();
+
+    let dev = crate::chat::DeveloperContent::new().with_function_tools(vec![ToolDescription::new(
+        "authenticate_first_name",
+        "Authenticate the caller's first name.",
+        Some(json!({
+            "$defs": {
+                "Schema": {
+                    "type": "object",
+                    "properties": {
+                        "input": {"type": "string"},
+                        "notes": {"type": "string"}
+                    },
+                    "required": ["input", "notes"],
+                    "additionalProperties": false
+                }
+            },
+            "type": "object",
+            "properties": {
+                "data": {"$ref": "#/$defs/Schema"}
+            },
+            "required": ["data"],
+            "additionalProperties": false
+        })),
+    )]);
+
+    let convo = Conversation::from_messages([
+        Message::from_role_and_content(
+            Role::System,
+            SystemContent::new()
+                .with_reasoning_effort(ReasoningEffort::High)
+                .with_conversation_start_date("2025-06-28"),
+        ),
+        Message::from_role_and_content(Role::Developer, dev),
+        Message::from_role_and_content(Role::User, "My first name is Michel."),
+    ]);
+
+    let tokens = encoding
+        .render_conversation_for_completion(&convo, Role::Assistant, None)
+        .unwrap();
+
+    let decoded = encoding.tokenizer.decode_utf8(&tokens).unwrap();
+    assert!(decoded.contains("type authenticate_first_name = (_: {"));
+    assert!(decoded.contains("data: {"));
+    assert!(decoded.contains("input: string,"));
+    assert!(decoded.contains("notes: string,"));
+    assert!(!decoded.contains("#/$defs/Schema"));
+}
+
+#[test]
+fn test_render_functions_with_ref_parameter_overrides() {
+    let encoding = load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss).unwrap();
+
+    let dev = crate::chat::DeveloperContent::new().with_function_tools(vec![ToolDescription::new(
+        "authenticate_first_name",
+        "Authenticate the caller's first name.",
+        Some(json!({
+            "$defs": {
+                "Schema": {
+                    "type": "object",
+                    "properties": {
+                        "input": {"type": "string"},
+                        "notes": {"type": "string"}
+                    },
+                    "required": ["input"],
+                    "additionalProperties": false
+                }
+            },
+            "type": "object",
+            "properties": {
+                "data": {
+                    "$ref": "#/$defs/Schema",
+                    "description": "Expanded caller data.",
+                    "required": ["notes"]
+                }
+            },
+            "required": ["data"],
+            "additionalProperties": false
+        })),
+    )]);
+
+    let convo = Conversation::from_messages([
+        Message::from_role_and_content(
+            Role::System,
+            SystemContent::new()
+                .with_reasoning_effort(ReasoningEffort::High)
+                .with_conversation_start_date("2025-06-28"),
+        ),
+        Message::from_role_and_content(Role::Developer, dev),
+        Message::from_role_and_content(Role::User, "My first name is Michel."),
+    ]);
+
+    let tokens = encoding
+        .render_conversation_for_completion(&convo, Role::Assistant, None)
+        .unwrap();
+
+    let decoded = encoding.tokenizer.decode_utf8(&tokens).unwrap();
+    assert!(decoded.contains("// Expanded caller data."));
+    assert!(decoded.contains("input: string,"));
+    assert!(decoded.contains("notes: string,"));
+    assert!(!decoded.contains("notes?: string,"));
+}
+
+#[test]
 fn test_browser_and_python_tool() {
     let encoding = load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss).unwrap();
     let expected_output = load_test_data("../test-data/test_browser_and_python_tool.txt");
